@@ -20,11 +20,13 @@ if [ -x "/opt/local/bin/singularity-labwc-session" ]; then
 else
     BIN="$TARGET_HOME/.local/singularity/bin"
     LIB="$TARGET_HOME/.local/singularity/lib"
+    LIBEXEC="$TARGET_HOME/.local/singularity/libexec"
     LAUNCHER="$BIN/singularity-session"
 
     cat > "$LAUNCHER" << LAUNCHER_EOF
 #!/bin/bash
 BIN="$BIN"
+LIBEXEC="$LIBEXEC"
 export PATH="\$BIN:\$PATH"
 export LD_LIBRARY_PATH="$LIB\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 STATE="\${XDG_STATE_HOME:-\$HOME/.local/state}/singularity"
@@ -34,7 +36,16 @@ LOG="\$STATE/session.log"
 exec > "\$LOG" 2>&1
 echo "[\$(date)] Starting Singularity session"
 
-nohup "\$BIN/singularity-polkit-agent" >> "\$STATE/polkit.log" 2>&1 &
+# meson installs the polkit agent to libexecdir; deploy-to-host.sh flattens it
+# into bindir. Prefer libexec, fall back to bin, then to \$PATH.
+if [ -x "\$LIBEXEC/singularity-polkit-agent" ]; then
+    _polkit_agent="\$LIBEXEC/singularity-polkit-agent"
+elif [ -x "\$BIN/singularity-polkit-agent" ]; then
+    _polkit_agent="\$BIN/singularity-polkit-agent"
+else
+    _polkit_agent="\$(command -v singularity-polkit-agent 2>/dev/null || printf '%s' "\$LIBEXEC/singularity-polkit-agent")"
+fi
+nohup "\$_polkit_agent" >> "\$STATE/polkit.log" 2>&1 &
 
 if [ -n "\$GDM_SESSION_DBUS_ADDRESS" ] && [ -x "/usr/libexec/gdm-wayland-session" ]; then
     echo "GDM detected - wrapping with gdm-wayland-session"

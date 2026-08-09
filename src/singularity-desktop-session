@@ -5,6 +5,20 @@ PREFIX="$(dirname "$BIN")"
 LIB="$PREFIX/lib"
 SHARE="$PREFIX/share"
 _DESKTOP="${SINGULARITY_DESKTOP_BINARY:-$BIN/singularity-desktop}"
+LIBEXEC="$PREFIX/libexec"
+
+# Resolve an installed helper. meson installs some helpers (the polkit agent and
+# its auth helper) to libexecdir, while scripts/deploy-to-host.sh flattens them
+# into bindir. Prefer libexec, fall back to bin, then to $PATH.
+singularity_helper() {
+    if [ -x "$LIBEXEC/$1" ]; then
+        printf '%s\n' "$LIBEXEC/$1"
+    elif [ -x "$BIN/$1" ]; then
+        printf '%s\n' "$BIN/$1"
+    else
+        command -v "$1" 2>/dev/null || printf '%s\n' "$LIBEXEC/$1"
+    fi
+}
 
 export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PATH="$BIN:$PATH"
@@ -108,7 +122,7 @@ pkill -TERM -x singularity-desktop 2>/dev/null || true
 pkill -x singularity-polkit-agent 2>/dev/null || true
 pkill -TERM -x ush-broker 2>/dev/null || true
 sleep 0.3
-nohup "$BIN/singularity-polkit-agent" >> "$_STATE/polkit.log" 2>&1 &
+nohup "$(singularity_helper singularity-polkit-agent)" >> "$_STATE/polkit.log" 2>&1 &
 if [ -x "$BIN/ush-broker" ]; then
     nohup "$BIN/ush-broker" >> "$_STATE/ush-broker.log" 2>&1 &
 fi
