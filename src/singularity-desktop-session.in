@@ -5,7 +5,11 @@ PREFIX="$(dirname "$BIN")"
 LIB="$PREFIX/lib"
 SHARE="$PREFIX/share"
 _DESKTOP="${SINGULARITY_DESKTOP_BINARY:-$BIN/singularity-desktop}"
-LIBEXEC="$PREFIX/libexec"
+# LIBEXECDIR is Meson's actually-configured libexecdir (get_option('libexecdir'),
+# resolved against get_option('prefix') at configure time), not a guess derived
+# from where this script happens to be running -- get_option('libexecdir')
+# doesn't have to be "$PREFIX/libexec" (packagers can and do override it).
+LIBEXEC="@LIBEXECDIR@"
 
 # Resolve an installed helper. meson installs some helpers (the polkit agent and
 # its auth helper) to libexecdir, while scripts/deploy-to-host.sh flattens them

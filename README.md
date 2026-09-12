@@ -16,8 +16,11 @@ session with GDM.
 - `singularity-desktop-session` is started by `labwc` and brings up the shell,
   the polkit agent, and the portal, then keeps the shell alive.
 
-Both derive their prefix from their own location, so they work from
-`/opt/local`, `/usr/local`, or `/usr` without modification.
+Both derive their prefix (and `lib`/`share`) from their own install location,
+so they work from `/opt/local`, `/usr/local`, or `/usr` without modification.
+`singularity-desktop-session` gets its `libexecdir` from Meson at configure
+time instead, since a packager can point `-Dlibexecdir=` somewhere that isn't
+simply `<prefix>/libexec`.
 
 ## Build & Install
 
