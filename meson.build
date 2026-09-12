@@ -18,3 +18,7 @@ install_data(
   install_dir: get_option('datadir') / 'singularity' / 'labwc',
   install_mode: 'rwxr-xr-x',
 )
+
+session_test_bash = find_program('bash')
+test('session-safe-mode', session_test_bash,
+  args: files('tests/session_safe_mode_test.sh'))

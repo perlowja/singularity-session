@@ -4,6 +4,7 @@ BIN="$(dirname "$SELF")"
 PREFIX="$(dirname "$BIN")"
 LIB="$PREFIX/lib"
 SHARE="$PREFIX/share"
+_DESKTOP="${SINGULARITY_DESKTOP_BINARY:-$BIN/singularity-desktop}"
 
 export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PATH="$BIN:$PATH"
@@ -24,6 +25,57 @@ fi
 
 _STATE="${XDG_STATE_HOME:-$HOME/.local/state}/singularity"
 mkdir -p "$_STATE"
+_LOG="$_STATE/desktop.log"
+
+run_desktop_supervisor() {
+    _crashes=0
+    _crash_window_started=0
+    _crash_window_seconds=300
+    _crash_limit=3
+    while true; do
+        _t0=$SECONDS
+        "$_DESKTOP" >> "$_LOG" 2>&1
+        _EC=$?
+        _dt=$((SECONDS - _t0))
+        if [ $_EC -eq 0 ]; then
+            echo "[$(date)] singularity-desktop exited 0, restarting..." >> "$_LOG"
+            _crashes=0
+            _crash_window_started=0
+            sleep 0.2
+        else
+            _now=$SECONDS
+            if [ $_crashes -eq 0 ] || [ $((_now - _crash_window_started)) -gt $_crash_window_seconds ]; then
+                _crashes=1
+                _crash_window_started=$_now
+            else
+                _crashes=$((_crashes + 1))
+            fi
+            if [ $_crashes -ge $_crash_limit ]; then
+                _request="$_STATE/safe-mode-request"
+                _request_tmp="${_request}.tmp.$$"
+                (umask 077; {
+                    printf 'version=1\n'
+                    printf 'build_id=%s\n' "${SINGULARITY_SESSION_BUILD_ID:-unknown}"
+                    printf 'reason=repeated-shell-failure\n'
+                } > "$_request_tmp") && chmod 600 "$_request_tmp" &&
+                    mv -f "$_request_tmp" "$_request"
+                echo "[$(date)] singularity-desktop crashed $_crashes times within ${_crash_window_seconds}s; requesting Safe Mode." >> "$_LOG"
+                kill "$PPID" 2>/dev/null || true
+                return 1
+            fi
+            echo "[$(date)] singularity-desktop exited $_EC after ${_dt}s (crash $_crashes/$_crash_limit), restarting in 2s..." >> "$_LOG"
+            sleep 2
+        fi
+    done
+}
+
+# Side-effect-free entry point for the supervisor black-box test. It must stay
+# before process cleanup, helper startup, and user-service mutations below.
+if [ "${SINGULARITY_SESSION_SUPERVISOR_ONLY:-0}" = "1" ]; then
+    run_desktop_supervisor
+    exit $?
+fi
+
 # labwc does not run /etc/xdg/autostart, so create the XDG user dirs here (idempotent,
 # locale-aware): Desktop/Documents/Downloads/... on the now-decrypted /home (FB-15).
 command -v xdg-user-dirs-update >/dev/null 2>&1 && xdg-user-dirs-update 2>/dev/null || true
@@ -39,7 +91,6 @@ dbus-update-activation-environment \
     GSETTINGS_SCHEMA_DIR XDG_DATA_DIRS GI_TYPELIB_PATH PATH LD_LIBRARY_PATH \
     2>/dev/null || true
 
-_LOG="$_STATE/desktop.log"
 [ -f "$_LOG" ] && mv -f "$_LOG" "$_LOG.1"
 _SPID="${XDG_RUNTIME_DIR:-/tmp}/singularity-desktop-session.pid"
 if [ -f "$_SPID" ]; then
@@ -66,24 +117,5 @@ fi
 # waiting for our portal backend, which would delay the shell launch below.
 systemctl --user restart --no-block xdg-desktop-portal 2>/dev/null || true
 
-_fails=0
-while true; do
-    _t0=$SECONDS
-    "$BIN/singularity-desktop" >> "$_LOG" 2>&1
-    _EC=$?
-    _dt=$((SECONDS - _t0))
-    if [ $_EC -eq 0 ]; then
-        echo "[$(date)] singularity-desktop exited 0, restarting..." >> "$_LOG"
-        _fails=0
-        sleep 0.2
-    else
-        if [ $_dt -lt 3 ]; then _fails=$((_fails + 1)); else _fails=0; fi
-        if [ $_fails -ge 5 ]; then
-            echo "[$(date)] singularity-desktop failed fast $_fails times (compositor gone?), ending the session instead of looping." >> "$_LOG"
-            kill "$PPID" 2>/dev/null || true
-            exit 1
-        fi
-        echo "[$(date)] singularity-desktop exited $_EC after ${_dt}s, restarting in 2s..." >> "$_LOG"
-        sleep 2
-    fi
-done
+run_desktop_supervisor
+exit $?

@@ -26,38 +26,168 @@ done
 _STATE="${XDG_STATE_HOME:-$HOME/.local/state}/singularity"
 mkdir -p "$_STATE"
 _LLOG="$_STATE/labwc.log"
+_SAFE_MARKER="$_STATE/safe-mode"
+_SAFE_REQUEST="$_STATE/safe-mode-request"
 [ -f "$_LLOG" ] && mv -f "$_LLOG" "$_LLOG.1"
 
+if [ -n "${SINGULARITY_LABWC_BINARY:-}" ]; then
+    _LABWC="$SINGULARITY_LABWC_BINARY"
+else
+    # Keep this literal path as a packaging seam: the Nix package replaces it
+    # with the compositor from PATH.
+    _LABWC="$BIN/labwc"
+fi
+_DESKTOP_SESSION="${SINGULARITY_DESKTOP_SESSION_BINARY:-$BIN/singularity-desktop-session}"
+_DESKTOP="${SINGULARITY_DESKTOP_BINARY:-$BIN/singularity-desktop}"
+if [ -n "${SINGULARITY_SESSION_BUILD_ID:-}" ]; then
+    _BUILD_ID="$SINGULARITY_SESSION_BUILD_ID"
+elif command -v sha256sum >/dev/null 2>&1; then
+    _LABWC_IDENTITY=$(command -v "$_LABWC" 2>/dev/null || printf '%s' "$_LABWC")
+    _DESKTOP_IDENTITY=$(command -v "$_DESKTOP_SESSION" 2>/dev/null || printf '%s' "$_DESKTOP_SESSION")
+    _SHELL_IDENTITY=$(command -v "$_DESKTOP" 2>/dev/null || printf '%s' "$_DESKTOP")
+    _BUILD_ID="$({
+        for _binary in "$_LABWC_IDENTITY" "$_DESKTOP_IDENTITY" "$_SHELL_IDENTITY"; do
+            if [ -r "$_binary" ]; then
+                sha256sum "$_binary"
+            else
+                printf 'missing:%s\n' "$_binary"
+            fi
+        done
+    } | sha256sum | cut -d' ' -f1)"
+else
+    _BUILD_ID="$PREFIX"
+fi
+export SINGULARITY_SESSION_BUILD_ID="$_BUILD_ID"
+
 [ -r /etc/vconsole.conf ] && . /etc/vconsole.conf
-[ -n "$XKBLAYOUT" ] && export XKB_DEFAULT_LAYOUT="$XKBLAYOUT"
-[ -n "$XKBVARIANT" ] && export XKB_DEFAULT_VARIANT="$XKBVARIANT"
+[ -n "${XKBLAYOUT:-}" ] && export XKB_DEFAULT_LAYOUT="$XKBLAYOUT"
+[ -n "${XKBVARIANT:-}" ] && export XKB_DEFAULT_VARIANT="$XKBVARIANT"
 
 run_labwc() {
-    if [ -n "$GDM_SESSION_DBUS_ADDRESS" ] && [ -x "/usr/libexec/gdm-wayland-session" ]; then
-        /usr/libexec/gdm-wayland-session "$BIN/labwc" -S "$BIN/singularity-desktop-session"
-    elif [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus" ] && command -v dbus-run-session >/dev/null 2>&1; then
-        dbus-run-session -- "$BIN/labwc" -S "$BIN/singularity-desktop-session"
+    if [ -n "${GDM_SESSION_DBUS_ADDRESS:-}" ] && [ -x "/usr/libexec/gdm-wayland-session" ]; then
+        /usr/libexec/gdm-wayland-session "$_LABWC" -S "$_DESKTOP_SESSION"
+    elif [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus" ] && command -v dbus-run-session >/dev/null 2>&1; then
+        dbus-run-session -- "$_LABWC" -S "$_DESKTOP_SESSION"
     else
-        "$BIN/labwc" -S "$BIN/singularity-desktop-session"
+        "$_LABWC" -S "$_DESKTOP_SESSION"
     fi
 }
 
-# Try the hardware renderer first (GSK default gl, labwc default drm/gl). If the
-# session dies within a few seconds it is an early crash on the real GL/GPU path
-# (invisible under QEMU's software path), so fall back to software rendering: the
-# desktop comes up anyway, degraded but alive, and the crash stays in the log for
-# diagnosis (#78). singularity-desktop-session honours an exported GSK_RENDERER.
-_t0=$SECONDS
-run_labwc >> "$_LLOG" 2>&1
-_rc=$?
-_dt=$((SECONDS - _t0))
-if [ "$_dt" -lt 30 ]; then
-    echo "[$(date)] labwc session exited rc=$_rc after ${_dt}s; retrying with software rendering (GSK_RENDERER=cairo, WLR_RENDERER=pixman)" >> "$_LLOG"
+run_attempt() {
+    _ATTEMPT_LABEL="$1"
+    _t0=$SECONDS
+    run_labwc >> "$_LLOG" 2>&1
+    _ATTEMPT_RC=$?
+    _ATTEMPT_DT=$((SECONDS - _t0))
+    _ATTEMPT_SAFE_REQUEST=0
+    if safe_request_matches_build; then
+        _ATTEMPT_SAFE_REQUEST=1
+    fi
+    [ -f "$_SAFE_REQUEST" ] && rm -f "$_SAFE_REQUEST"
+    echo "[$(date)] $_ATTEMPT_LABEL exited rc=$_ATTEMPT_RC after ${_ATTEMPT_DT}s" >> "$_LLOG"
+}
+
+is_recovery_failure() {
+    [ "${_ATTEMPT_SAFE_REQUEST:-0}" = "1" ] ||
+        { [ "$1" -ne 0 ] && [ "$1" -ne 130 ] && [ "$1" -ne 143 ] && [ "$2" -lt 30 ]; }
+}
+
+marker_matches_build() {
+    [ -f "$_SAFE_MARKER" ] || return 1
+    _marker_build=$(sed -n 's/^build_id=//p' "$_SAFE_MARKER" 2>/dev/null | head -n 1)
+    [ -n "$_marker_build" ] && [ "$_marker_build" = "$_BUILD_ID" ]
+}
+
+safe_request_matches_build() {
+    [ -f "$_SAFE_REQUEST" ] || return 1
+    _request_build=$(sed -n 's/^build_id=//p' "$_SAFE_REQUEST" 2>/dev/null | head -n 1)
+    [ -n "$_request_build" ] && [ "$_request_build" = "$_BUILD_ID" ]
+}
+
+write_safe_marker() {
+    _failed_rc="$1"
+    _failed_dt="$2"
+    _marker_tmp="${_SAFE_MARKER}.tmp.$$"
+    if (umask 077; {
+        echo "version=1"
+        echo "build_id=$_BUILD_ID"
+        echo "reason=repeated-session-failure"
+        echo "exit_status=$_failed_rc"
+        echo "elapsed_seconds=$_failed_dt"
+        echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$_marker_tmp") && chmod 600 "$_marker_tmp" && mv -f "$_marker_tmp" "$_SAFE_MARKER"; then
+        return 0
+    fi
+    echo "[$(date)] could not persist Safe Mode marker at $_SAFE_MARKER" >> "$_LLOG"
+    rm -f "$_marker_tmp"
+    return 1
+}
+
+enable_software_rendering() {
     export GSK_RENDERER=cairo
     export WLR_RENDERER=pixman
     export LIBGL_ALWAYS_SOFTWARE=1
     export GALLIUM_DRIVER=llvmpipe
-    run_labwc >> "$_LLOG" 2>&1
-    _rc=$?
+}
+
+run_safe_mode() {
+    # Safe mode suppresses optional shell features; it must NOT force the
+    # software rendering stack. On machines with a working GPU, rendering the
+    # whole session on the CPU maxes out cores and makes the recovery session
+    # unusably slow (libinput lag, crawl), and in the escalation ladder the
+    # software path has already failed by the time safe mode starts. Set
+    # SINGULARITY_SAFE_MODE_SOFTWARE=1 to force it when the GPU stack itself
+    # is the suspected culprit.
+    if [ "${SINGULARITY_SAFE_MODE_SOFTWARE:-0}" = "1" ]; then
+        enable_software_rendering
+    else
+        unset GSK_RENDERER WLR_RENDERER LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER
+    fi
+    export SINGULARITY_SAFE_MODE=1
+    export SINGULARITY_SAFE_MODE_MARKER="$_SAFE_MARKER"
+    export SINGULARITY_SAFE_MODE_REASON="Repeated startup failures"
+    echo "[$(date)] starting Safe Mode; persisted settings remain writable" >> "$_LLOG"
+    run_attempt "Safe Mode session"
+}
+
+# An explicit manual Safe Mode request does not need a marker.
+if [ "${SINGULARITY_SAFE_MODE:-0}" = "1" ]; then
+    run_safe_mode
+    exit "$_ATTEMPT_RC"
 fi
-exit $_rc
+
+# If the outer supervisor was terminated before it could consume an inner
+# shell-crash request, honor that request on the next display-manager launch.
+if safe_request_matches_build; then
+    rm -f "$_SAFE_REQUEST"
+    write_safe_marker 1 0 || true
+    run_safe_mode
+    exit "$_ATTEMPT_RC"
+fi
+[ -f "$_SAFE_REQUEST" ] && rm -f "$_SAFE_REQUEST"
+
+# A marker only applies to the binaries that created it. After an update, try
+# normal mode again so a fixed build cannot remain trapped in recovery mode.
+if [ "${SINGULARITY_FORCE_NORMAL:-0}" != "1" ] && marker_matches_build; then
+    run_safe_mode
+    exit "$_ATTEMPT_RC"
+fi
+[ -f "$_SAFE_MARKER" ] && rm -f "$_SAFE_MARKER"
+
+unset SINGULARITY_SAFE_MODE SINGULARITY_SAFE_MODE_MARKER SINGULARITY_SAFE_MODE_REASON
+run_attempt "normal compositor session"
+if ! is_recovery_failure "$_ATTEMPT_RC" "$_ATTEMPT_DT"; then
+    exit "$_ATTEMPT_RC"
+fi
+
+# Preserve the existing renderer fallback as the second normal-mode attempt.
+echo "[$(date)] early compositor failure; retrying with software rendering (GSK_RENDERER=cairo, WLR_RENDERER=pixman)" >> "$_LLOG"
+enable_software_rendering
+run_attempt "software compositor session"
+if ! is_recovery_failure "$_ATTEMPT_RC" "$_ATTEMPT_DT"; then
+    exit "$_ATTEMPT_RC"
+fi
+
+write_safe_marker "$_ATTEMPT_RC" "$_ATTEMPT_DT" || true
+run_safe_mode
+exit "$_ATTEMPT_RC"
