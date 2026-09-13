@@ -103,7 +103,11 @@ export SINGULARITY_DESKTOP_BINARY="$0"
 export SINGULARITY_TEST_FAKE_DESKTOP=1
 export SINGULARITY_TEST_SHELL_ATTEMPTS="$TEST_DIR/shell-attempts"
 export SINGULARITY_SESSION_SUPERVISOR_ONLY=1
-DESKTOP_LAUNCHER="$(dirname "$0")/../src/singularity-desktop-session"
+# singularity-desktop-session is generated from src/singularity-desktop-session.in
+# by configure_file(), so under meson test we exercise the generated launcher
+# (SINGULARITY_TEST_DESKTOP_SESSION, set in meson.build). Outside meson, fall
+# back to the template: the supervisor path under test never reads @LIBEXECDIR@.
+DESKTOP_LAUNCHER="${SINGULARITY_TEST_DESKTOP_SESSION:-$(dirname "$0")/../src/singularity-desktop-session.in}"
 set +e
 bash -c 'trap "" TERM; bash "$1" & child=$!; wait "$child"' _ "$DESKTOP_LAUNCHER"
 set -e
