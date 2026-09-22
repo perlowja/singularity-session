@@ -23,6 +23,61 @@ for drv in /sys/class/drm/card[0-9]*/device/driver; do
     esac
 done
 
+# Hybrid-GPU (Optimus-style) render offload, measured 2026-09-22 on PEGASUS
+# (RTX 2060 Mobile + Intel CometLake-H iGPU): whatever set WLR_DRM_DEVICES
+# ahead of this script (GDM's own multi-GPU pick, observed on this hardware)
+# chose the Intel card alone -- correct for scanout (the eDP panel is wired
+# only to Intel on this class of laptop, the nvidia GPU has no connected
+# output at all) but it silently leaves the dedicated GPU completely unused
+# for rendering. wlroots' WLR_DRM_DEVICES accepts a colon-separated list
+# where the FIRST entry is the render GPU and later entries are scanout-only
+# -- so if we find exactly one card with a real nvidia/amdgpu driver AND no
+# connected output, plus another card that DOES have a connected output, we
+# have a discrete-render + iGPU-scanout laptop and should render on the
+# discrete GPU while still displaying through the connected one. Do nothing
+# if that pattern isn't unambiguous (single-GPU boxes, real dual-monitor
+# multi-GPU setups, docks) -- this only targets the specific hybrid-laptop
+# shape, not general multi-GPU policy.
+if [ "${SINGULARITY_DISABLE_PRIME_DETECT:-0}" != "1" ]; then
+    # Measured 2026-09-22: GDM (or whatever launched this script) had ALREADY
+    # set WLR_DRM_DEVICES to the scanout-only card before this script even
+    # started running -- an emptiness check here would never fire. Always
+    # run detection and, if the hybrid-laptop pattern below is unambiguous,
+    # override whatever was inherited. SINGULARITY_DISABLE_PRIME_DETECT=1 is
+    # the explicit admin escape hatch for a manually-configured WLR_DRM_DEVICES.
+    _render_only_card=""
+    _scanout_card=""
+    _ambiguous=0
+    for card_dir in /sys/class/drm/card[0-9]*; do
+        [ -d "$card_dir" ] || continue
+        card_name="$(basename "$card_dir")"
+        [ -e "$card_dir/device/driver" ] || continue
+        driver="$(basename "$(readlink -f "$card_dir/device/driver")")"
+        has_connected=0
+        for status in "$card_dir"-*/status; do
+            [ -r "$status" ] || continue
+            [ "$(cat "$status" 2>/dev/null)" = connected ] && has_connected=1 && break
+        done
+        case "$driver" in
+            nvidia|amdgpu)
+                if [ "$has_connected" = 0 ]; then
+                    [ -n "$_render_only_card" ] && _ambiguous=1
+                    _render_only_card="/dev/dri/$card_name"
+                fi
+                ;;
+        esac
+        if [ "$has_connected" = 1 ]; then
+            [ -n "$_scanout_card" ] && _ambiguous=1
+            _scanout_card="/dev/dri/$card_name"
+        fi
+    done
+    if [ "$_ambiguous" = 0 ] && [ -n "$_render_only_card" ] && [ -n "$_scanout_card" ] \
+       && [ "$_render_only_card" != "$_scanout_card" ]; then
+        export WLR_DRM_DEVICES="$_render_only_card:$_scanout_card"
+        echo "[$(date)] hybrid GPU detected: rendering on $_render_only_card, scanout via $_scanout_card (WLR_DRM_DEVICES=$WLR_DRM_DEVICES)" >> "${XDG_STATE_HOME:-$HOME/.local/state}/singularity/labwc.log" 2>/dev/null || true
+    fi
+fi
+
 _STATE="${XDG_STATE_HOME:-$HOME/.local/state}/singularity"
 mkdir -p "$_STATE"
 _LLOG="$_STATE/labwc.log"
